@@ -205,6 +205,31 @@ curl https://ifconfig.me
   Current DNS: automatic
 ```
 
+### DNS Leak Testing
+
+A comprehensive DNS leak test script is included: `test-dns-leak.sh`
+
+```bash
+# Run the DNS leak test
+./test-dns-leak.sh
+
+# The test checks:
+# - /etc/resolv.conf configuration
+# - systemd-resolved status
+# - Fallback DNS servers
+# - LLMNR/mDNS status (leak vectors)
+# - IPv6 status
+# - iptables DNS rules
+# - Actual DNS resolution
+# - Tor connectivity
+# - External DNS leak test
+```
+
+This tool is useful for:
+- Verifying your Tor setup has no DNS leaks
+- Checking your general system for DNS privacy issues
+- Confirming VPN DNS configuration
+
 ## Troubleshooting
 
 ### Tor routing not working?
@@ -250,8 +275,16 @@ The tool will automatically detect and list missing dependencies when you try to
 
 ## Files Created
 
+### Temporary Files
 - `/tmp/alltor-state` - Saved network configuration (cleaned up on stop)
 - `/tmp/alltor.lock` - Lock file to prevent concurrent execution
+- `/tmp/alltor-saved-fallback.conf` - Backup of fallback DNS config (if it exists)
+
+### System Configuration Files (while Tor is active)
+- `/etc/systemd/resolved.conf.d/tor-dns.conf` - Tor DNS configuration (auto-created on start, auto-removed on stop)
+
+### Optional Permanent Configuration
+- `/etc/systemd/resolved.conf.d/no-fallback.conf` - Disables fallback DNS permanently (if you create it manually)
 
 ## Cross-Distribution Compatibility
 
@@ -267,6 +300,59 @@ Tested on:
 - Fedora
 - Other systemd-based distributions
 
+## DNS Privacy & Fallback DNS
+
+### Understanding DNS Fallback (Important for All Users)
+
+By default, systemd-resolved (used by most modern Linux distributions) includes fallback DNS servers from Google (8.8.8.8), Cloudflare (1.1.1.1), and Quad9 (9.9.9.9). While this seems helpful, it's actually a **privacy concern for all users**, not just Tor users.
+
+#### The Privacy Problem
+
+When your primary DNS server has even a brief hiccup:
+1. Your system silently switches to fallback DNS (Google/Cloudflare)
+2. **All your DNS queries are now logged by these companies**
+3. They can see: which websites you visit, when, and how often
+4. This happens **without your knowledge or consent**
+
+#### Who Should Disable Fallback DNS?
+
+✅ **VPN Users** - Fallback DNS queries can leak outside your VPN tunnel  
+✅ **Privacy-Conscious Users** - Avoid silent logging by Google/Cloudflare  
+✅ **Tor Users** - Essential for preventing DNS leaks  
+✅ **Corporate/Institutional Users** - Prevent bypassing DNS policies
+
+#### Disable Fallback DNS (Recommended)
+
+**Option 1: Permanently disable (most secure)**
+```bash
+sudo mkdir -p /etc/systemd/resolved.conf.d
+sudo tee /etc/systemd/resolved.conf.d/no-fallback.conf > /dev/null << 'EOF'
+[Resolve]
+FallbackDNS=
+EOF
+sudo systemctl restart systemd-resolved
+```
+
+**Option 2: Let alltor manage it (automatic)**  
+The `alltor` tool automatically disables fallback DNS when starting Tor routing and can restore it when stopping. Just use `alltor start` and `alltor stop`.
+
+#### To Re-enable Fallback DNS (if needed)
+```bash
+sudo rm -f /etc/systemd/resolved.conf.d/no-fallback.conf
+sudo systemctl restart systemd-resolved
+```
+
+#### The Trade-off
+
+| With Fallback DNS | Without Fallback DNS |
+|-------------------|---------------------|
+| ✅ Slightly more resilient to DNS outages | ⚠️ If primary DNS fails, no resolution |
+| ❌ Privacy leak to Google/Cloudflare | ✅ Your DNS provider choice is respected |
+| ❌ Potential VPN/Tor DNS leaks | ✅ No unexpected DNS leaks |
+| ❌ Can bypass security policies | ✅ Fail-secure behavior |
+
+**Our Recommendation**: Disable fallback DNS. DNS failures are rare, but privacy leaks are constant. You'll notice if DNS breaks and can fix it, but you won't notice silent logging.
+
 ## Security Notes
 
 ### What This Tool Does
@@ -274,6 +360,8 @@ Tested on:
 - Prevents DNS leaks by routing DNS through Tor
 - Disables IPv6 to prevent leak vectors
 - Blocks UDP traffic (not supported by Tor)
+- Disables systemd-resolved fallback DNS when active
+- Disables LLMNR and mDNS to prevent DNS leaks
 
 ### What This Tool Does NOT Do
 - **Does not provide complete anonymity** - Use Tor Browser for web browsing

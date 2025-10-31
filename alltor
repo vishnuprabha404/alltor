@@ -222,12 +222,38 @@ start_tor() {
             nmcli connection modify "$active_conn" ipv4.dns "127.0.0.1"
         sudo nmcli connection modify "$active_conn" ipv4.ignore-auto-dns yes 2>/dev/null || \
             nmcli connection modify "$active_conn" ipv4.ignore-auto-dns yes
+        sudo nmcli connection modify "$active_conn" ipv6.dns "" 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv6.dns ""
+        sudo nmcli connection modify "$active_conn" ipv6.ignore-auto-dns yes 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv6.ignore-auto-dns yes
         sudo nmcli connection up "$active_conn" >/dev/null 2>&1 || \
             nmcli connection up "$active_conn" >/dev/null 2>&1
         echo -e "${GREEN}✓${NC} DNS set to ${YELLOW}127.0.0.1${NC} (Tor DNS)"
     else
         log_warning "NetworkManager not found, DNS configuration skipped"
         log_info "You may need to manually configure DNS to 127.0.0.1"
+    fi
+    
+    # Additional DNS leak protection: Configure systemd-resolved
+    if command -v resolvectl &> /dev/null; then
+        log_info "Configuring systemd-resolved for Tor..."
+        # Temporarily disable LLMNR, mDNS, and fallback DNS to prevent DNS leaks
+        sudo mkdir -p /etc/systemd/resolved.conf.d
+        
+        # Save existing fallback DNS configuration if it exists
+        if [ -f /etc/systemd/resolved.conf.d/no-fallback.conf ]; then
+            sudo cp /etc/systemd/resolved.conf.d/no-fallback.conf /tmp/alltor-saved-fallback.conf 2>/dev/null || true
+        fi
+        
+        sudo tee /etc/systemd/resolved.conf.d/tor-dns.conf > /dev/null << 'EOFTOR'
+[Resolve]
+DNS=127.0.0.1
+FallbackDNS=
+LLMNR=no
+MulticastDNS=no
+EOFTOR
+        sudo systemctl restart systemd-resolved 2>/dev/null || true
+        log_success "systemd-resolved configured for Tor (fallback DNS disabled)"
     fi
     
     # Flush iptables first
@@ -263,6 +289,14 @@ start_tor() {
     # Redirect all DNS (UDP+TCP) through Tor
     sudo iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports $TRANS_PORT_DNS
     sudo iptables -t nat -A OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports $TRANS_PORT_DNS
+    
+    # Block DNS to external servers before redirection (extra leak protection)
+    sudo iptables -A OUTPUT -p udp --dport 53 -m owner --uid-owner "$tor_uid" -j ACCEPT
+    sudo iptables -A OUTPUT -p tcp --dport 53 -m owner --uid-owner "$tor_uid" -j ACCEPT
+    sudo iptables -A OUTPUT -p udp --dport 53 -d 127.0.0.0/8 -j ACCEPT
+    sudo iptables -A OUTPUT -p tcp --dport 53 -d 127.0.0.0/8 -j ACCEPT
+    sudo iptables -A OUTPUT -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable
+    sudo iptables -A OUTPUT -p tcp --dport 53 -j REJECT --reject-with tcp-reset
     
     # Redirect all TCP through Tor
     sudo iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports $TRANS_PORT
@@ -365,6 +399,21 @@ stop_tor() {
         sudo sysctl -w net.ipv6.conf."$iface".disable_ipv6=0 >/dev/null 2>&1 || true
     fi
     log_success "IPv6 re-enabled."
+    
+    echo ""
+    log_info "→ Restoring systemd-resolved settings..."
+    # Remove Tor-specific systemd-resolved config
+    if [ -f /etc/systemd/resolved.conf.d/tor-dns.conf ]; then
+        sudo rm -f /etc/systemd/resolved.conf.d/tor-dns.conf
+        
+        # Restore saved fallback configuration if it existed
+        if [ -f /tmp/alltor-saved-fallback.conf ]; then
+            sudo mv /tmp/alltor-saved-fallback.conf /etc/systemd/resolved.conf.d/no-fallback.conf 2>/dev/null || true
+        fi
+        
+        sudo systemctl restart systemd-resolved 2>/dev/null || true
+        log_success "systemd-resolved settings restored to normal"
+    fi
     
     echo ""
     log_info "→ Waiting for network to stabilize..."
