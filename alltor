@@ -1,0 +1,757 @@
+#!/bin/bash
+
+# alltor - Unified Tor routing tool
+# Combines tor-route.sh and tor-stop.sh functionality
+
+set -eo pipefail
+
+# Configuration
+TRANS_PORT=9040
+TRANS_PORT_DNS=5353
+STATE_FILE="/tmp/alltor-state"
+LOCK_FILE="/tmp/alltor.lock"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() { echo -e "${BLUE}ℹ${NC} $1"; }
+log_success() { echo -e "${GREEN}✓${NC} $1"; }
+log_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
+log_error() { echo -e "${RED}❌${NC} $1"; }
+
+# Check if running as root for certain operations
+check_sudo() {
+    if [ "$EUID" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        log_error "Some operations require sudo. Please run with sudo privileges."
+        exit 1
+    fi
+}
+
+# Acquire lock to prevent concurrent execution
+acquire_lock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if ps -p "$pid" > /dev/null 2>&1; then
+            log_error "Another alltor instance is running (PID: $pid)"
+            exit 1
+        else
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    echo $$ > "$LOCK_FILE"
+}
+
+# Release lock
+release_lock() {
+    rm -f "$LOCK_FILE"
+}
+
+# Cleanup on exit
+cleanup() {
+    release_lock
+}
+trap cleanup EXIT INT TERM
+
+# Detect active network interface and connection
+detect_network() {
+    local iface=$(nmcli -t -f DEVICE connection show --active | head -n1)
+    local active_conn=$(nmcli -t -f NAME,DEVICE connection show --active | grep "$iface" | cut -d: -f1)
+    
+    if [ -z "$iface" ] || [ -z "$active_conn" ]; then
+        log_error "No active network connection detected"
+        return 1
+    fi
+    
+    echo "$iface|$active_conn"
+}
+
+# Save current DNS and IPv6 settings
+save_state() {
+    local iface=$(detect_network | cut -d'|' -f1)
+    local active_conn=$(detect_network | cut -d'|' -f2)
+    
+    if [ -z "$iface" ] || [ -z "$active_conn" ]; then
+        return 1
+    fi
+    
+    # Save DNS settings
+    local ipv4_dns=$(nmcli -t connection show "$active_conn" | grep ipv4.dns | cut -d: -f2 | tr ' ' ',')
+    local ipv6_dns=$(nmcli -t connection show "$active_conn" | grep ipv6.dns | cut -d: -f2 | tr ' ' ',')
+    local ipv4_ignore_dns=$(nmcli -t connection show "$active_conn" | grep ipv4.ignore-auto-dns | cut -d: -f2)
+    local ipv6_ignore_dns=$(nmcli -t connection show "$active_conn" | grep ipv6.ignore-auto-dns | cut -d: -f2)
+    
+    # Save IPv6 state
+    local ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
+    
+    # Use proper quoting for connection names with spaces
+    # Escape quotes and use eval-safe format
+    cat > "$STATE_FILE" <<'EOFFILE'
+IFACE=
+ACTIVE_CONN=
+IPV4_DNS=
+IPV6_DNS=
+IPV4_IGNORE_DNS=
+IPV6_IGNORE_DNS=
+IPV6_DISABLED=
+EOFFILE
+    # Now append the values (properly quoted)
+    echo "IFACE=\"$iface\"" > "$STATE_FILE"
+    echo "ACTIVE_CONN=\"$active_conn\"" >> "$STATE_FILE"
+    echo "IPV4_DNS=\"$ipv4_dns\"" >> "$STATE_FILE"
+    echo "IPV6_DNS=\"$ipv6_dns\"" >> "$STATE_FILE"
+    echo "IPV4_IGNORE_DNS=\"$ipv4_ignore_dns\"" >> "$STATE_FILE"
+    echo "IPV6_IGNORE_DNS=\"$ipv6_ignore_dns\"" >> "$STATE_FILE"
+    echo "IPV6_DISABLED=\"$ipv6_disabled\"" >> "$STATE_FILE"
+    
+    log_info "State saved for restoration"
+}
+
+# Start Tor routing
+start_tor() {
+    log_info "🚀 Starting Tor routing..."
+    
+    # Check if already running
+    if [ -f "$STATE_FILE" ]; then
+        log_warning "Tor routing may already be active. Use 'alltor stop' first."
+        read -p "Continue anyway? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 0
+        fi
+    fi
+    
+    # Check dependencies
+    local missing_deps=()
+    
+    if ! command -v systemctl &> /dev/null; then
+        missing_deps+=("systemctl (systemd)")
+    fi
+    
+    if ! command -v nmcli &> /dev/null; then
+        missing_deps+=("nmcli (NetworkManager)")
+    fi
+    
+    if ! command -v iptables &> /dev/null; then
+        missing_deps+=("iptables")
+    fi
+    
+    if ! command -v curl &> /dev/null; then
+        missing_deps+=("curl")
+    fi
+    
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        log_error "Missing required dependencies:"
+        for dep in "${missing_deps[@]}"; do
+            echo "  - $dep"
+        done
+        echo ""
+        log_info "Please install missing dependencies and try again."
+        exit 1
+    fi
+    
+    # Detect network
+    local network_info=$(detect_network)
+    if [ -z "$network_info" ]; then
+        exit 1
+    fi
+    
+    local iface=$(echo "$network_info" | cut -d'|' -f1)
+    local active_conn=$(echo "$network_info" | cut -d'|' -f2)
+    
+    log_info "Active connection: $active_conn ($iface)"
+    
+    # Save current state
+    save_state
+    
+    # Ensure Tor is running
+    log_info "Starting Tor service..."
+    if ! systemctl is-active --quiet tor 2>/dev/null; then
+        sudo systemctl start tor 2>/dev/null || {
+            log_error "Failed to start Tor service"
+            log_info "Trying alternative: sudo service tor start"
+            sudo service tor start 2>/dev/null || {
+                log_error "Failed to start Tor. Please start it manually."
+                exit 1
+            }
+        }
+    fi
+    
+    # Wait for Tor to be ready
+    log_info "Waiting for Tor to initialize..."
+    local wait_count=0
+    while [ $wait_count -lt 15 ]; do
+        if systemctl is-active --quiet tor 2>/dev/null || pgrep -x tor > /dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        ((wait_count++))
+    done
+    
+    if ! systemctl is-active --quiet tor 2>/dev/null && ! pgrep -x tor > /dev/null 2>&1; then
+        log_error "Tor service failed to start or is not ready"
+        exit 1
+    fi
+    
+    log_success "Tor service is running"
+    
+    # Find Tor UID (try different common usernames)
+    local tor_uid=""
+    for user in tor debian-tor _tor; do
+        tor_uid=$(id -u $user 2>/dev/null)
+        if [ -n "$tor_uid" ]; then
+            log_info "Found Tor user '$user' (UID: $tor_uid)"
+            break
+        fi
+    done
+    
+    if [ -z "$tor_uid" ]; then
+        log_error "Cannot find Tor user (tried: tor, debian-tor, _tor)"
+        log_error "Is Tor installed correctly?"
+        exit 1
+    fi
+    
+    # Configure NetworkManager to use Tor DNS
+    log_info "Configuring DNS to use Tor..."
+    if command -v nmcli &> /dev/null; then
+        sudo nmcli connection modify "$active_conn" ipv4.dns "127.0.0.1" 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv4.dns "127.0.0.1"
+        sudo nmcli connection modify "$active_conn" ipv4.ignore-auto-dns yes 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv4.ignore-auto-dns yes
+        sudo nmcli connection up "$active_conn" >/dev/null 2>&1 || \
+            nmcli connection up "$active_conn" >/dev/null 2>&1
+        echo -e "${GREEN}✓${NC} DNS set to ${YELLOW}127.0.0.1${NC} (Tor DNS)"
+    else
+        log_warning "NetworkManager not found, DNS configuration skipped"
+        log_info "You may need to manually configure DNS to 127.0.0.1"
+    fi
+    
+    # Flush iptables first
+    log_info "Configuring firewall rules..."
+    if command -v iptables &> /dev/null; then
+        sudo iptables -F 2>/dev/null || true
+        sudo iptables -t nat -F 2>/dev/null || true
+    else
+        log_error "iptables not found"
+        exit 1
+    fi
+    
+    # Disable IPv6 on all interfaces
+    log_info "Disabling IPv6..."
+    for iface_path in /proc/sys/net/ipv6/conf/*/; do
+        [ -d "$iface_path" ] || continue
+        local iface_name=$(basename "$iface_path")
+        [ "$iface_name" = "all" ] || [ "$iface_name" = "default" ] && continue
+        sudo sysctl -w "net.ipv6.conf.$iface_name.disable_ipv6=1" >/dev/null 2>&1 || true
+    done
+    sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+    sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+    log_success "IPv6 disabled"
+    
+    # Allow Tor UID
+    sudo iptables -A OUTPUT -m owner --uid-owner "$tor_uid" -j ACCEPT
+    sudo iptables -t nat -A OUTPUT -m owner --uid-owner "$tor_uid" -j RETURN
+    
+    # Allow loopback
+    sudo iptables -A OUTPUT -o lo -j ACCEPT
+    sudo iptables -A INPUT -i lo -j ACCEPT
+    
+    # Redirect all DNS (UDP+TCP) through Tor
+    sudo iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports $TRANS_PORT_DNS
+    sudo iptables -t nat -A OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports $TRANS_PORT_DNS
+    
+    # Redirect all TCP through Tor
+    sudo iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports $TRANS_PORT
+    
+    # Block all other UDP traffic (Tor doesn't support UDP except DNS)
+    # This prevents UDP leaks
+    sudo iptables -A OUTPUT -p udp -m owner --uid-owner "$tor_uid" -j ACCEPT
+    sudo iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+    sudo iptables -A OUTPUT -p udp -j REJECT
+    
+    log_success "Firewall rules configured"
+    
+    # Wait for Tor to initialize fully
+    log_info "Waiting for Tor to initialize..."
+    sleep 5
+    
+    # Test Tor connection
+    log_info "Testing Tor connection..."
+    local tor_test=$(curl -s --max-time 10 https://check.torproject.org/ 2>/dev/null || echo "")
+    if echo "$tor_test" | grep -q "Congratulations"; then
+        log_success "Tor routing is active!"
+        local tor_ip=$(curl -s --max-time 10 https://ifconfig.me 2>/dev/null || echo "Unable to retrieve")
+        echo -e "  ${GREEN}Tor exit IP: ${YELLOW}$tor_ip${NC}"
+        echo ""
+        log_success "🚀 All traffic is now routed through Tor!"
+    else
+        log_warning "Tor test failed. Tor may not be fully ready yet, or there might be connectivity issues."
+        log_info "Try checking: curl https://check.torproject.org/"
+    fi
+}
+
+# Stop Tor routing
+stop_tor() {
+    log_info "🛑 Stopping Tor routing and restoring normal connection..."
+    
+    # Auto-detect the active network interface (like tor-stop.sh does)
+    local iface=""
+    local active_conn=""
+    
+    if command -v nmcli &> /dev/null; then
+        iface=$(nmcli -t -f DEVICE connection show --active 2>/dev/null | head -n1)
+        active_conn=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep "$iface" | cut -d: -f1)
+    fi
+    
+    if [ -n "$active_conn" ] && [ -n "$iface" ]; then
+        log_info "→ Active connection detected: $active_conn ($iface)"
+        
+        log_info "→ Resetting DNS to automatic mode..."
+        # Clear manual DNS and re-enable automatic DNS
+        sudo nmcli connection modify "$active_conn" ipv4.dns "" 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv4.dns ""
+        sudo nmcli connection modify "$active_conn" ipv4.ignore-auto-dns no 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv4.ignore-auto-dns no
+        sudo nmcli connection modify "$active_conn" ipv4.dns-search "" 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv4.dns-search ""
+        sudo nmcli connection modify "$active_conn" ipv6.dns "" 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv6.dns ""
+        sudo nmcli connection modify "$active_conn" ipv6.ignore-auto-dns no 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv6.ignore-auto-dns no
+        sudo nmcli connection modify "$active_conn" ipv6.dns-search "" 2>/dev/null || \
+            nmcli connection modify "$active_conn" ipv6.dns-search ""
+        
+        log_info "→ Bringing connection down and up..."
+        sudo nmcli connection down "$active_conn" >/dev/null 2>&1 || \
+            nmcli connection down "$active_conn" >/dev/null 2>&1
+        sleep 1
+        sudo nmcli connection up "$active_conn" >/dev/null 2>&1 || \
+            nmcli connection up "$active_conn" >/dev/null 2>&1
+        
+        log_success "Network connection reset to default DNS and routing."
+    else
+        log_warning "⚠ No active connection found or NetworkManager not available"
+        log_info "DNS and network settings may need manual restoration"
+    fi
+    
+    echo ""
+    log_info "→ Flushing firewall rules..."
+    
+    # Prefer firewalld if active, otherwise fallback to iptables
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        sudo firewall-cmd --reload >/dev/null 2>&1 || \
+            firewall-cmd --reload >/dev/null 2>&1
+        log_success "Firewalld rules reloaded."
+    else
+        sudo iptables -F 2>/dev/null || true
+        sudo iptables -t nat -F 2>/dev/null || true
+        sudo iptables -t mangle -F 2>/dev/null || true
+        sudo iptables -X 2>/dev/null || true
+        sudo iptables -P INPUT ACCEPT 2>/dev/null || true
+        sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
+        sudo iptables -P OUTPUT ACCEPT 2>/dev/null || true
+        log_success "iptables rules flushed."
+    fi
+    
+    echo ""
+    log_info "→ Re-enabling IPv6..."
+    sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+    sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+    if [ -n "$iface" ]; then
+        sudo sysctl -w net.ipv6.conf."$iface".disable_ipv6=0 >/dev/null 2>&1 || true
+    fi
+    log_success "IPv6 re-enabled."
+    
+    echo ""
+    log_info "→ Waiting for network to stabilize..."
+    sleep 3
+    
+    log_info "🌐 Testing connectivity..."
+    if ping -c 2 8.8.8.8 >/dev/null 2>&1; then
+        log_success "Internet connectivity verified."
+        local real_ip=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "")
+        [ -n "$real_ip" ] && echo -e "  ${GREEN}Current IP: ${YELLOW}$real_ip${NC}"
+    else
+        log_warning "Ping test failed. Try reconnecting manually:"
+        echo "  nmcli connection up \"$active_conn\""
+    fi
+    
+    echo ""
+    log_info "🧾 Current DNS servers:"
+    if [ -n "$iface" ]; then
+        nmcli device show "$iface" 2>/dev/null | grep -E 'IP[46]\.DNS' || true
+    fi
+    
+    # Clean up state file
+    rm -f "$STATE_FILE"
+    
+    echo ""
+    log_success "✅ Normal (non-Tor) routing restored successfully!"
+}
+
+# Removed - health check is now integrated into status
+# Legacy health_check function kept for compatibility
+health_check() {
+    local verbose="${1:-false}"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local health_status="OK"
+    local issues=()
+    local warnings=()
+    
+    if [ "$verbose" = "true" ]; then
+        log_info "🏥 Performing health check... ($timestamp)"
+    fi
+    
+    # Check if Tor routing is supposed to be active
+    if [ ! -f "$STATE_FILE" ]; then
+        if [ "$verbose" = "true" ]; then
+            log_info "Tor routing is not active (no state file)"
+        fi
+        echo "INACTIVE|$timestamp|Tor routing not active"
+        return 0
+    fi
+    
+    # Try to source, but fallback to detection if it fails
+    set +e
+    . "$STATE_FILE" 2>/dev/null
+    set -eo pipefail
+    
+    # If sourcing failed or variables are empty, detect network
+    if [ -z "$IFACE" ] || [ -z "$ACTIVE_CONN" ]; then
+        local network_info=$(detect_network 2>/dev/null)
+        if [ -n "$network_info" ]; then
+            IFACE=$(echo "$network_info" | cut -d'|' -f1)
+            ACTIVE_CONN=$(echo "$network_info" | cut -d'|' -f2)
+        fi
+    else
+        # Remove quotes if present
+        IFACE="${IFACE//\"/}"
+        ACTIVE_CONN="${ACTIVE_CONN//\"/}"
+    fi
+    
+    # Check 1: Tor service status
+    if ! systemctl is-active --quiet tor 2>/dev/null; then
+        health_status="FAIL"
+        issues+=("Tor service is not running")
+        if [ "$verbose" = "true" ]; then
+            log_error "Tor service is not running"
+        fi
+    else
+        if [ "$verbose" = "true" ]; then
+            log_success "Tor service is running"
+        fi
+    fi
+    
+    # Check 2: Network connection
+    local network_info=$(detect_network 2>/dev/null)
+    if [ -z "$network_info" ]; then
+        health_status="FAIL"
+        issues+=("No active network connection detected")
+        if [ "$verbose" = "true" ]; then
+            log_error "No active network connection"
+        fi
+    else
+        local current_iface=$(echo "$network_info" | cut -d'|' -f1)
+        if [ "$current_iface" != "$IFACE" ]; then
+            warnings+=("Network interface changed from $IFACE to $current_iface")
+            if [ "$verbose" = "true" ]; then
+                log_warning "Network interface changed"
+            fi
+        else
+            if [ "$verbose" = "true" ]; then
+                log_success "Network interface OK: $IFACE"
+            fi
+        fi
+    fi
+    
+    # Check 3: DNS configuration
+    local current_dns=$(nmcli -t connection show "$ACTIVE_CONN" 2>/dev/null | grep "^ipv4.dns:" | cut -d: -f2)
+    # Remove any whitespace
+    current_dns=$(echo "$current_dns" | tr -d ' ')
+    
+    if [ "$current_dns" != "127.0.0.1" ]; then
+        health_status="FAIL"
+        issues+=("DNS not set to 127.0.0.1 (current: $current_dns)")
+        if [ "$verbose" = "true" ]; then
+            log_error "DNS configuration incorrect (current: $current_dns)"
+        fi
+    else
+        if [ "$verbose" = "true" ]; then
+            log_success "DNS configured correctly (127.0.0.1)"
+        fi
+    fi
+    
+    # Check 4: iptables rules (basic check)
+    local iptables_rules=$(sudo iptables -t nat -L OUTPUT 2>/dev/null | grep -c "$TRANS_PORT" || echo "0")
+    if [ "$iptables_rules" -eq "0" ]; then
+        health_status="FAIL"
+        issues+=("iptables rules for Tor not found")
+        if [ "$verbose" = "true" ]; then
+            log_error "iptables rules missing"
+        fi
+    else
+        if [ "$verbose" = "true" ]; then
+            log_success "iptables rules present ($iptables_rules rules found)"
+        fi
+    fi
+    
+    # Check 5: Tor connectivity test (most important)
+    local tor_test=$(curl -s --max-time 10 https://check.torproject.org/ 2>/dev/null || echo "")
+    if ! echo "$tor_test" | grep -q "Congratulations"; then
+        health_status="FAIL"
+        issues+=("Tor connectivity test failed")
+        if [ "$verbose" = "true" ]; then
+            log_error "Tor connectivity test failed"
+        fi
+    else
+        local tor_ip=$(curl -s --max-time 10 https://ifconfig.me 2>/dev/null || echo "Unknown")
+        if [ "$verbose" = "true" ]; then
+            log_success "Tor connectivity OK"
+            echo -e "  ${GREEN}Tor exit IP: ${YELLOW}$tor_ip${NC}"
+        fi
+    fi
+    
+    # Check 6: IPv6 status
+    local ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "1")
+    if [ "$ipv6_disabled" != "1" ]; then
+        warnings+=("IPv6 is enabled (should be disabled for Tor routing)")
+        if [ "$verbose" = "true" ]; then
+            log_warning "IPv6 is enabled"
+        fi
+    else
+        if [ "$verbose" = "true" ]; then
+            log_success "IPv6 correctly disabled"
+        fi
+    fi
+    
+    # Summary
+    if [ ${#issues[@]} -gt 0 ]; then
+        if [ "$verbose" = "true" ]; then
+            echo ""
+            log_error "Health check FAILED:"
+            for issue in "${issues[@]}"; do
+                echo "  - $issue"
+            done
+        fi
+    fi
+    
+    if [ ${#warnings[@]} -gt 0 ]; then
+        if [ "$verbose" = "true" ]; then
+            for warning in "${warnings[@]}"; do
+                echo "  - $warning"
+            done
+        fi
+    fi
+    
+    if [ "$health_status" = "OK" ] && [ ${#warnings[@]} -eq 0 ]; then
+        if [ "$verbose" = "true" ]; then
+            echo ""
+            log_success "All health checks passed!"
+        fi
+    elif [ "$health_status" = "OK" ] && [ ${#warnings[@]} -gt 0 ]; then
+        if [ "$verbose" = "true" ]; then
+            echo ""
+            log_warning "Health check passed with warnings"
+        fi
+    fi
+    
+    # Return exit code based on health status
+    if [ "$health_status" = "FAIL" ]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+# Check status (includes health check)
+status() {
+    log_info "🔍 Checking Tor status..."
+    
+    if [ -f "$STATE_FILE" ]; then
+        # Try to source, but fallback to detection if it fails
+        set +e
+        . "$STATE_FILE" 2>/dev/null
+        set -eo pipefail
+        
+        # If sourcing failed or variables are empty, detect network
+        if [ -z "$IFACE" ] || [ -z "$ACTIVE_CONN" ]; then
+            local network_info=$(detect_network 2>/dev/null)
+            if [ -n "$network_info" ]; then
+                IFACE=$(echo "$network_info" | cut -d'|' -f1)
+                ACTIVE_CONN=$(echo "$network_info" | cut -d'|' -f2)
+            fi
+        else
+            # Remove quotes if present
+            IFACE="${IFACE//\"/}"
+            ACTIVE_CONN="${ACTIVE_CONN//\"/}"
+        fi
+        
+        log_success "Tor routing is ACTIVE"
+        echo ""
+        
+        # Run health checks
+        local issues=()
+        local warnings=()
+        
+        # Check 1: Tor service
+        if systemctl is-active --quiet tor 2>/dev/null; then
+            log_success "Tor service is running"
+        else
+            log_error "Tor service is not running"
+            issues+=("Tor service stopped")
+        fi
+        
+        # Check 2: Network interface
+        log_success "Network interface: $IFACE"
+        
+        # Check 3: DNS configuration
+        local current_dns=$(nmcli -t connection show "$ACTIVE_CONN" 2>/dev/null | grep "^ipv4.dns:" | cut -d: -f2 | tr -d ' ')
+        if [ "$current_dns" = "127.0.0.1" ]; then
+            echo -e "${GREEN}✓${NC} DNS: ${YELLOW}$current_dns${NC} (Tor DNS)"
+        else
+            echo -e "${YELLOW}⚠${NC} DNS: ${YELLOW}$current_dns${NC} (Expected: 127.0.0.1)"
+            warnings+=("DNS not set to Tor")
+        fi
+        
+        # Check 4: IPv6 status
+        local ipv6_status=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "1")
+        if [ "$ipv6_status" = "1" ]; then
+            log_success "IPv6 is disabled"
+        else
+            log_warning "IPv6 is enabled (should be disabled)"
+            warnings+=("IPv6 enabled")
+        fi
+        
+        # Check 5: Tor connectivity
+        echo ""
+        log_info "Testing Tor connectivity..."
+        local tor_test=$(curl -s --max-time 10 https://check.torproject.org/ 2>/dev/null || echo "")
+        if echo "$tor_test" | grep -q "Congratulations"; then
+            local tor_ip=$(curl -s --max-time 10 https://ifconfig.me 2>/dev/null || echo "Unable to retrieve")
+            log_success "Tor connectivity verified"
+            echo -e "  ${GREEN}Tor exit IP: ${YELLOW}${tor_ip}${NC}"
+        else
+            log_error "Tor connectivity test failed"
+            issues+=("Cannot connect through Tor")
+        fi
+        
+        # Summary
+        echo ""
+        if [ ${#issues[@]} -eq 0 ] && [ ${#warnings[@]} -eq 0 ]; then
+            log_success "✅ All checks passed - Tor is working properly"
+        elif [ ${#issues[@]} -gt 0 ]; then
+            log_error "❌ Issues detected:"
+            for issue in "${issues[@]}"; do
+                echo "  - $issue"
+            done
+        elif [ ${#warnings[@]} -gt 0 ]; then
+            log_warning "⚠ Warnings:"
+            for warning in "${warnings[@]}"; do
+                echo "  - $warning"
+            done
+        fi
+    else
+        log_info "Tor routing is INACTIVE"
+        echo ""
+        
+        # Quick check if Tor might be running anyway
+        local tor_test=$(curl -s --max-time 5 https://check.torproject.org/ 2>/dev/null || echo "")
+        if echo "$tor_test" | grep -q "Congratulations"; then
+            log_warning "Tor check suggests routing is active (state file missing)"
+        else
+            local real_ip=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "Unable to retrieve")
+            log_success "Normal routing active"
+            echo -e "  ${GREEN}Current IP: ${YELLOW}${real_ip}${NC}"
+            
+            # Show current DNS
+            if command -v nmcli &> /dev/null; then
+                local iface=$(nmcli -t -f DEVICE connection show --active 2>/dev/null | head -n1)
+                local active_conn=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep "$iface" | cut -d: -f1)
+                if [ -n "$active_conn" ]; then
+                    local current_dns=$(nmcli -t connection show "$active_conn" 2>/dev/null | grep "^ipv4.dns:" | cut -d: -f2 | tr -d ' ')
+                    if [ -n "$current_dns" ]; then
+                        echo -e "  ${GREEN}Current DNS: ${YELLOW}${current_dns}${NC}"
+                    else
+                        echo -e "  ${GREEN}Current DNS: ${YELLOW}automatic${NC}"
+                    fi
+                fi
+            fi
+        fi
+    fi
+}
+
+# Show usage
+usage() {
+    cat <<EOF
+${GREEN}alltor${NC} - Unified Tor routing tool with health monitoring
+
+Usage: alltor {start|stop|status|help}
+
+Commands:
+  start   - Start Tor routing (all traffic through Tor)
+  stop    - Stop Tor routing and restore normal connection
+  status  - Check Tor status with diagnostics
+  help    - Show this help message
+
+Requirements:
+  - systemd (systemctl) or compatible init system
+  - NetworkManager (nmcli) recommended
+  - iptables
+  - curl
+  - Tor service installed
+
+Examples:
+  alltor start    # Start routing through Tor
+  alltor stop     # Stop routing and restore normal connection
+  alltor status   # Check status and run diagnostics
+
+Status Check:
+  The status command verifies:
+  - Tor service is running
+  - Network interface
+  - DNS configuration (should be 127.0.0.1)
+  - Tor connectivity (via check.torproject.org)
+  - IPv6 status (should be disabled)
+
+Note: Some operations require sudo privileges.
+
+EOF
+}
+
+# Main script logic
+acquire_lock
+
+# Parse command line arguments
+COMMAND="${1:-}"
+
+case "$COMMAND" in
+    start)
+        start_tor
+        ;;
+    stop)
+        stop_tor
+        ;;
+    status)
+        status
+        ;;
+    help|--help|-h)
+        usage
+        ;;
+    "")
+        log_error "No command specified"
+        echo ""
+        usage
+        exit 1
+        ;;
+    *)
+        log_error "Unknown command: $COMMAND"
+        echo ""
+        usage
+        exit 1
+        ;;
+esac
+
