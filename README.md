@@ -88,9 +88,9 @@ sudo systemctl enable tor
 ## Installation
 
 ```bash
-# Clone or download the repository
-git clone <your-repo-url>
-cd All-tor
+# Clone the repository
+git clone https://github.com/vishnuprabha404/alltor.git
+cd alltor
 
 # Make executable
 chmod +x alltor
