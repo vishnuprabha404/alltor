@@ -24,6 +24,46 @@ log_success() { echo -e "${GREEN}✓${NC} $1"; }
 log_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error() { echo -e "${RED}❌${NC} $1"; }
 
+# Show random banner
+show_banner() {
+    # Resolve script location even if called via symlink
+    local script_path="${BASH_SOURCE[0]}"
+    
+    # Follow symlinks to get the real script location
+    while [ -L "$script_path" ]; do
+        script_path="$(readlink -f "$script_path")"
+    done
+    
+    local script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    local banner_dir="$script_dir/banners"
+    
+    # Check if banner directory exists
+    if [ ! -d "$banner_dir" ]; then
+        # Fallback to simple text if no banner directory
+        echo -e "${GREEN}alltor${NC} - Tor Routing Tool"
+        return
+    fi
+    
+    # Get list of banner files
+    local banners=("$banner_dir"/banner*.txt)
+    
+    # Check if any banners exist
+    if [ ! -e "${banners[0]}" ]; then
+        echo -e "${GREEN}alltor${NC} - Tor Routing Tool"
+        return
+    fi
+    
+    # Select random banner
+    local random_banner="${banners[$RANDOM % ${#banners[@]}]}"
+    
+    # Display banner in green
+    echo -e "${GREEN}"
+    cat "$random_banner"
+    echo -e "${NC}"
+    echo -e "${BLUE}Unified Tor routing tool with health monitoring${NC}"
+    echo ""
+}
+
 # Check if running as root for certain operations
 check_sudo() {
     if [ "$EUID" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -113,6 +153,7 @@ EOFFILE
 
 # Start Tor routing
 start_tor() {
+    show_banner
     log_info "🚀 Starting Tor routing..."
     
     # Check if already running
@@ -330,6 +371,7 @@ EOFTOR
 
 # Stop Tor routing
 stop_tor() {
+    show_banner
     log_info "🛑 Stopping Tor routing and restoring normal connection..."
     
     # Auto-detect the active network interface (like tor-stop.sh does)
@@ -618,6 +660,7 @@ health_check() {
 
 # Check status (includes health check)
 status() {
+    show_banner
     log_info "🔍 Checking Tor status..."
     
     if [ -f "$STATE_FILE" ]; then
@@ -735,40 +778,22 @@ status() {
 
 # Show usage
 usage() {
-    cat <<EOF
-${GREEN}alltor${NC} - Unified Tor routing tool with health monitoring
-
-Usage: alltor {start|stop|status|help}
-
-Commands:
-  start   - Start Tor routing (all traffic through Tor)
-  stop    - Stop Tor routing and restore normal connection
-  status  - Check Tor status with diagnostics
-  help    - Show this help message
-
-Requirements:
-  - systemd (systemctl) or compatible init system
-  - NetworkManager (nmcli) recommended
-  - iptables
-  - curl
-  - Tor service installed
-
-Examples:
-  alltor start    # Start routing through Tor
-  alltor stop     # Stop routing and restore normal connection
-  alltor status   # Check status and run diagnostics
-
-Status Check:
-  The status command verifies:
-  - Tor service is running
-  - Network interface
-  - DNS configuration (should be 127.0.0.1)
-  - Tor connectivity (via check.torproject.org)
-  - IPv6 status (should be disabled)
-
-Note: Some operations require sudo privileges.
-
-EOF
+    show_banner
+    echo "Usage: alltor {start|stop|status|help}"
+    echo ""
+    echo "Commands:"
+    echo "  start   - Start Tor routing (all traffic through Tor)"
+    echo "  stop    - Stop Tor routing and restore normal connection"
+    echo "  status  - Check Tor status with diagnostics"
+    echo "  help    - Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  alltor start    # Start routing through Tor"
+    echo "  alltor stop     # Stop routing and restore normal connection"
+    echo "  alltor status   # Check status and run diagnostics"
+    echo ""
+    echo -e "${YELLOW}Note:${NC} Requires sudo privileges. See README for full requirements."
+    echo ""
 }
 
 # Main script logic

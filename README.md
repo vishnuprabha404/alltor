@@ -2,6 +2,34 @@
 
 Unified Tor routing tool for Linux - routes all system traffic through Tor transparently.
 
+## ⚠️ LEGAL DISCLAIMER
+
+**USE AT YOUR OWN RISK!**
+
+This tool is provided for **educational and research purposes only**. The author and contributors are **NOT responsible** for any misuse or damage caused by this program. It is the end user's responsibility to obey all applicable local, state, and federal laws.
+
+**By using this tool, you agree that:**
+- You will use it only for **legal and ethical purposes**
+- You will **NOT** use it for illegal activities, unauthorized access, or malicious purposes
+- The developers assume **NO liability** and are **NOT responsible** for any misuse or damage caused by this program
+- You are **solely responsible** for your actions and any consequences thereof
+
+**This tool should be used for:**
+- ✅ Privacy and anonymity protection
+- ✅ Security research and testing on your own systems
+- ✅ Educational purposes
+- ✅ Bypassing censorship in restrictive environments
+
+**This tool should NOT be used for:**
+- ❌ Illegal activities
+- ❌ Unauthorized access to systems
+- ❌ Malicious hacking or attacks
+- ❌ Any activity that violates laws or regulations
+
+**The developers will not be held responsible for any criminal charges brought against individuals misusing this software.**
+
+---
+
 ## ⚠️ IMPORTANT CAUTIONS
 
 > **⚠️ This tool is still in active development. Use at your own risk.**
@@ -51,6 +79,8 @@ sudo iptables -P OUTPUT ACCEPT
 - ✅ Color-coded output with highlighted IPs and DNS
 - ✅ Graceful fallbacks for missing dependencies
 - ✅ Simple command-line interface
+- ✅ Random ASCII art banners (11 different designs)
+- ✅ DNS leak prevention with systemd-resolved integration
 
 ## Requirements
 
@@ -273,6 +303,25 @@ sudo journalctl -u tor -n 50
 
 The tool will automatically detect and list missing dependencies when you try to start it.
 
+## Customization
+
+### ASCII Art Banners
+
+The tool displays a random ASCII art banner every time you run it! There are 11 different designs included in the `banners/` directory.
+
+**View all banners:**
+```bash
+./test-banners.sh
+```
+
+**Add your own banner:**
+1. Create a new text file in `banners/` directory (e.g., `banner12.txt`)
+2. Add your ASCII art
+3. The tool will automatically include it in the random rotation
+
+**Disable banners:**
+Simply rename or remove the `banners/` directory, and the tool will fall back to simple text.
+
 ## Files Created
 
 ### Temporary Files
@@ -285,6 +334,9 @@ The tool will automatically detect and list missing dependencies when you try to
 
 ### Optional Permanent Configuration
 - `/etc/systemd/resolved.conf.d/no-fallback.conf` - Disables fallback DNS permanently (if you create it manually)
+
+### Banner Files
+- `banners/banner1.txt` through `banner11.txt` - ASCII art banners displayed randomly
 
 ## Cross-Distribution Compatibility
 
@@ -393,12 +445,30 @@ This tool is in **active development**. Features may change, and bugs may exist.
 
 ## License
 
-Use freely at your own risk. No warranties provided.
+**MIT License with Disclaimer**
+
+Copyright (c) 2025 alltor contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+**THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.**
+
+**ADDITIONAL DISCLAIMER:** The authors and copyright holders are not responsible for any illegal use of this software. Users must comply with all applicable laws and regulations. This software is intended for legal privacy protection, security research, and educational purposes only.
 
 ## Credits
 
 Based on transparent Tor proxy configuration techniques and inspired by various Tor routing implementations.
 
+## Repository
+
+- **GitHub**: https://github.com/vishnuprabha404/alltor
+- **Issues**: Report bugs and request features on GitHub Issues
+- **Contributions**: Pull requests are welcome!
+
 ---
 
 **Remember: This is a development tool. Always verify your anonymity setup and use Tor Browser for sensitive web browsing.**
+
+**Use responsibly and legally. The developers are not responsible for any misuse of this tool.**
