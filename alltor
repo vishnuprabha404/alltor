@@ -60,7 +60,7 @@ show_banner() {
     echo -e "${GREEN}"
     cat "$random_banner"
     echo -e "${NC}"
-    echo -e "${BLUE}Unified Tor routing tool with health monitoring${NC}"
+    echo -e "${BLUE}Transparent Tor routing for your entire system${NC}"
     echo ""
 }
 
@@ -154,6 +154,16 @@ EOFFILE
 # Start Tor routing
 start_tor() {
     show_banner
+    
+    # Prompt for sudo password if not already authenticated
+    if [ "$EUID" -ne 0 ]; then
+        log_info "This command requires sudo privileges. Please enter your password:"
+        sudo -v || {
+            log_error "Failed to authenticate"
+            exit 1
+        }
+    fi
+    
     log_info "🚀 Starting Tor routing..."
     
     # Check if already running
@@ -372,75 +382,67 @@ EOFTOR
 # Stop Tor routing
 stop_tor() {
     show_banner
-    log_info "🛑 Stopping Tor routing and restoring normal connection..."
     
-    # Auto-detect the active network interface (like tor-stop.sh does)
-    local iface=""
-    local active_conn=""
-    
-    if command -v nmcli &> /dev/null; then
-        iface=$(nmcli -t -f DEVICE connection show --active 2>/dev/null | head -n1)
-        active_conn=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep "$iface" | cut -d: -f1)
+    # Prompt for sudo password if not already authenticated
+    if [ "$EUID" -ne 0 ]; then
+        log_info "This command requires sudo privileges. Please enter your password:"
+        sudo -v || {
+            log_error "Failed to authenticate"
+            exit 1
+        }
     fi
     
-    if [ -n "$active_conn" ] && [ -n "$iface" ]; then
+    log_info "🧭 Stopping Tor routing and restoring normal connection..."
+    
+    # Auto-detect the active network interface
+    local iface=$(nmcli -t -f DEVICE connection show --active | head -n1)
+    local active_conn=$(nmcli -t -f NAME,DEVICE connection show --active | grep "$iface" | cut -d: -f1)
+    
+    if [ -n "$active_conn" ]; then
         log_info "→ Active connection detected: $active_conn ($iface)"
         
         log_info "→ Resetting DNS to automatic mode..."
         # Clear manual DNS and re-enable automatic DNS
-        sudo nmcli connection modify "$active_conn" ipv4.dns "" 2>/dev/null || \
-            nmcli connection modify "$active_conn" ipv4.dns ""
-        sudo nmcli connection modify "$active_conn" ipv4.ignore-auto-dns no 2>/dev/null || \
-            nmcli connection modify "$active_conn" ipv4.ignore-auto-dns no
-        sudo nmcli connection modify "$active_conn" ipv4.dns-search "" 2>/dev/null || \
-            nmcli connection modify "$active_conn" ipv4.dns-search ""
-        sudo nmcli connection modify "$active_conn" ipv6.dns "" 2>/dev/null || \
-            nmcli connection modify "$active_conn" ipv6.dns ""
-        sudo nmcli connection modify "$active_conn" ipv6.ignore-auto-dns no 2>/dev/null || \
-            nmcli connection modify "$active_conn" ipv6.ignore-auto-dns no
-        sudo nmcli connection modify "$active_conn" ipv6.dns-search "" 2>/dev/null || \
-            nmcli connection modify "$active_conn" ipv6.dns-search ""
+        sudo nmcli connection modify "$active_conn" ipv4.dns ""
+        sudo nmcli connection modify "$active_conn" ipv4.ignore-auto-dns no
+        sudo nmcli connection modify "$active_conn" ipv4.dns-search ""
+        sudo nmcli connection modify "$active_conn" ipv6.dns ""
+        sudo nmcli connection modify "$active_conn" ipv6.ignore-auto-dns no
+        sudo nmcli connection modify "$active_conn" ipv6.dns-search ""
         
         log_info "→ Bringing connection down and up..."
-        sudo nmcli connection down "$active_conn" >/dev/null 2>&1 || \
-            nmcli connection down "$active_conn" >/dev/null 2>&1
-        sleep 1
-        sudo nmcli connection up "$active_conn" >/dev/null 2>&1 || \
-            nmcli connection up "$active_conn" >/dev/null 2>&1
+        sudo nmcli connection down "$active_conn" >/dev/null 2>&1
+        sudo nmcli connection up "$active_conn" >/dev/null 2>&1
         
-        log_success "Network connection reset to default DNS and routing."
+        log_success "✓ Network connection reset to default DNS and routing."
     else
-        log_warning "⚠ No active connection found or NetworkManager not available"
-        log_info "DNS and network settings may need manual restoration"
+        log_warning "⚠ No active connection found! Check your network manually."
     fi
     
     echo ""
     log_info "→ Flushing firewall rules..."
     
     # Prefer firewalld if active, otherwise fallback to iptables
-    if systemctl is-active --quiet firewalld 2>/dev/null; then
-        sudo firewall-cmd --reload >/dev/null 2>&1 || \
-            firewall-cmd --reload >/dev/null 2>&1
-        log_success "Firewalld rules reloaded."
+    if systemctl is-active --quiet firewalld; then
+        sudo firewall-cmd --reload >/dev/null 2>&1
+        log_success "✓ Firewalld rules reloaded."
     else
-        sudo iptables -F 2>/dev/null || true
-        sudo iptables -t nat -F 2>/dev/null || true
-        sudo iptables -t mangle -F 2>/dev/null || true
-        sudo iptables -X 2>/dev/null || true
-        sudo iptables -P INPUT ACCEPT 2>/dev/null || true
-        sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
-        sudo iptables -P OUTPUT ACCEPT 2>/dev/null || true
-        log_success "iptables rules flushed."
+        sudo iptables -F
+        sudo iptables -t nat -F
+        sudo iptables -t mangle -F
+        sudo iptables -X
+        sudo iptables -P INPUT ACCEPT
+        sudo iptables -P FORWARD ACCEPT
+        sudo iptables -P OUTPUT ACCEPT
+        log_success "✓ iptables rules flushed."
     fi
     
     echo ""
     log_info "→ Re-enabling IPv6..."
-    sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
-    sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
-    if [ -n "$iface" ]; then
-        sudo sysctl -w net.ipv6.conf."$iface".disable_ipv6=0 >/dev/null 2>&1 || true
-    fi
-    log_success "IPv6 re-enabled."
+    sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+    sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+    sudo sysctl -w net.ipv6.conf."$iface".disable_ipv6=0 >/dev/null 2>&1
+    log_success "✓ IPv6 re-enabled."
     
     echo ""
     log_info "→ Restoring systemd-resolved settings..."
@@ -463,25 +465,22 @@ stop_tor() {
     
     log_info "🌐 Testing connectivity..."
     if ping -c 2 8.8.8.8 >/dev/null 2>&1; then
-        log_success "Internet connectivity verified."
-        local real_ip=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "")
-        [ -n "$real_ip" ] && echo -e "  ${GREEN}Current IP: ${YELLOW}$real_ip${NC}"
+        log_success "✓ Internet connectivity verified."
+        local real_ip=$(curl -s --max-time 5 https://ifconfig.me)
+        [ -n "$real_ip" ] && echo -e "  ${GREEN}✓ Current IP: ${YELLOW}$real_ip${NC}"
     else
-        log_warning "Ping test failed. Try reconnecting manually:"
+        log_warning "⚠ Ping test failed. Try reconnecting manually:"
         echo "  nmcli connection up \"$active_conn\""
     fi
     
     echo ""
     log_info "🧾 Current DNS servers:"
-    if [ -n "$iface" ]; then
-        nmcli device show "$iface" 2>/dev/null | grep -E 'IP[46]\.DNS' || true
-    fi
+    nmcli device show "$iface" | grep -E 'IP[46]\.DNS'
+    echo ""
+    log_success "✅ Normal (non-Tor) routing restored successfully!"
     
     # Clean up state file
     rm -f "$STATE_FILE"
-    
-    echo ""
-    log_success "✅ Normal (non-Tor) routing restored successfully!"
 }
 
 # Removed - health check is now integrated into status
